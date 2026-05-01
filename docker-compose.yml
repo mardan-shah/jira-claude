@@ -1,0 +1,88 @@
+volumes:
+  postgres-data:
+    driver: local
+  kestra-data:
+    driver: local
+
+services:
+  postgres:
+    image: postgres:16
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  kestra:
+    image: kestra/kestra:latest
+    pull_policy: never
+    user: "root"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # 1. Install Git and dependencies
+        apt-get update -y && apt-get install -y git jq curl || apk add --no-cache git jq bash python3
+
+        # Verify git installed
+        which git && echo "✅ Git installed at: $(which git)" || echo "❌ Git not found"
+
+        # 2. Bulletproof user creation
+        if ! grep -q "^admin:" /etc/passwd; then
+        echo "admin:x:1000:1000::/home/mardan:/bin/sh" >> /etc/passwd
+        fi
+        if ! grep -q "^admin:" /etc/group; then
+        echo "admin:x:1000:" >> /etc/group
+        fi
+        if ! grep -q "^admin:" /etc/shadow; then
+        echo "admin:*:19736:0:99999:7:::" >> /etc/shadow
+        fi
+        exec /app/kestra server standalone
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+      - /home/mardan:/home/mardan:rw
+      - /home/mardan/kestra:/home/mardan/kestra:rw
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      JAVA_OPTS: "-Xmx2048m -Xms512m -XX:+UseG1GC"
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: ${POSTGRES_PASSWORD}
+        kestra:
+          server:
+            worker-thread: 16
+            basicAuth:
+              enabled: true
+              username: "${KESTRA_ADMIN_USER}"
+              password: "${KESTRA_ADMIN_PASSWORD}"
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              basePath: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+    restart: unless-stopped

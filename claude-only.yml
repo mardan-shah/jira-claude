@@ -1,0 +1,112 @@
+id: jira_to_claude_automation_final
+namespace: engineering.devops
+
+inputs:
+  - id: manual_payload
+    type: STRING
+    defaults: '{"issue": {"key": "TEST-1", "fields": {"summary": "Manual Test Ticket", "status": {"name": "To Do"}, "description": "Testing Kestra"}}}'
+
+triggers:
+  - id: jira_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "8f8eeb688c3d8d691b1f549b48d50bf7186f6921d4b495fda5e797176616fe6b"
+
+variables:
+  JIRA_BASE_URL: "${JIRA_BASE_URL}"
+  JIRA_AUTH_BASIC: "${JIRA_AUTH_BASIC}"
+  SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
+
+tasks:
+  # Step 1: Run Claude CLI from host filesystem
+  - id: run_claude
+    type: io.kestra.plugin.scripts.shell.Commands
+    runner: PROCESS
+    timeout: PT2M
+    outputFiles:
+      - "claude_output.txt"
+    commands:
+      - |
+        export HOME=/home/mardan
+        export PATH="/home/mardan/.local/bin:/home/mardan/.local/share/fnm/node-versions/v24.12.0/installation/bin:$PATH"
+
+        export FORCE_COLOR=0
+        export TERM=dumb
+        export CI=true
+
+        printf "=== Environment Check ===\n" > "{{ outputDir }}/claude_output.txt"
+        printf "Node: $(which node) - $(node -v)\n" >> "{{ outputDir }}/claude_output.txt"
+        printf "Claude: $(which claude)\n" >> "{{ outputDir }}/claude_output.txt"
+        printf "=========================\n" >> "{{ outputDir }}/claude_output.txt"
+
+        cd /home/mardan/kestra
+
+        set +e
+
+        # We add < /dev/null BACK into the command. Now that the volume is Read-Write, 
+        # it will save its state successfully, hit the EOF, and exit immediately.
+        timeout 90 su admin -c "env PATH=\"$PATH\" HOME=/home/mardan FORCE_COLOR=0 TERM=dumb CI=true claude -p 'just testing things' --dangerously-skip-permissions --disallowedTools 'Bash(*)' < /dev/null" > raw_output.txt 2>&1
+        EXIT_CODE=$?
+
+        set -e
+
+        sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g; s/\x1B\][0-9;]*;//g; s/\r//g' raw_output.txt >> "{{ outputDir }}/claude_output.txt"
+        
+        if [ $EXIT_CODE -eq 124 ]; then
+          printf "\nERROR: Claude CLI timed out after 90 seconds (Exit 124)\n" >> "{{ outputDir }}/claude_output.txt"
+        elif [ $EXIT_CODE -ne 0 ]; then
+          printf "\nERROR: Claude CLI exited with code $EXIT_CODE\n" >> "{{ outputDir }}/claude_output.txt"
+        fi
+        
+        printf "\n=== Task Complete ===\n" >> "{{ outputDir }}/claude_output.txt"
+        
+        exit 0
+
+  # Step 2: Send Claude's output to Slack (success or error)
+  # - id: send_to_slack
+  #   type: io.kestra.plugin.scripts.shell.Commands
+  #   runner: PROCESS
+  #   inputFiles:
+  #     claude_output.txt: "{{ outputs.run_claude.outputFiles['claude_output.txt'] }}"
+  #   commands:
+  #     - |
+  #       CLAUDE_OUTPUT=$(cat claude_output.txt)
+
+  #       # Check if output contains error indicators
+  #       if echo "$CLAUDE_OUTPUT" | grep -qiE "^ERROR:|exception|command not found|No such file|ENOENT|EACCES|permission denied"; then
+  #         EMOJI=":x:"
+  #         HEADER="Claude Code FAILED"
+  #       else
+  #         EMOJI=":robot_face:"
+  #         HEADER="Claude Code Output"
+  #       fi
+
+  #       ESCAPED_OUTPUT=$(echo "$CLAUDE_OUTPUT" | python3 -c "
+  #       import sys, json
+  #       text = sys.stdin.read()
+  #       print(json.dumps(text)[1:-1])
+  #       ")
+
+  #       curl -s -X POST "{{ vars.SLACK_WEBHOOK_URL }}" \
+  #         -H "Content-Type: application/json" \
+  #         -d "{\"text\": \"${EMOJI} *${HEADER}*\n\`\`\`${ESCAPED_OUTPUT}\`\`\`\"}"
+
+  #       echo "Slack notification sent"
+
+# Flow-level error handler — catches hard crashes in any task
+errors:
+  - id: send_error_to_slack
+    type: io.kestra.plugin.scripts.shell.Commands
+    runner: PROCESS
+    commands:
+      - |
+        ERROR_MSG="Flow: {{ flow.id }} | Execution: {{ execution.id }} | Status: FAILED"
+
+        ESCAPED=$(echo "$ERROR_MSG" | python3 -c "
+        import sys, json
+        text = sys.stdin.read()
+        print(json.dumps(text)[1:-1])
+        ")
+
+        curl -s -X POST "{{ vars.SLACK_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"text\": \":fire: *Kestra Flow Error*\n\`\`\`${ESCAPED}\`\`\`\"}"

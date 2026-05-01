@@ -1,0 +1,506 @@
+id: jira_to_claude_automation_final
+namespace: engineering.devops
+
+inputs:
+  - id: manual_payload
+    type: STRING
+    defaults: '{"issue": {"key": "IGNIZ-115", "fields": {"summary": "Testing Kestra", "status": {"name": "Kestra Plan"}, "description": "Testing this ticket"}}}'
+
+triggers:
+  - id: jira_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "8f8eeb688c3d8d691b1f549b48d50bf7186f6921d4b495fda5e797176616fe6b"
+
+variables:
+  # =============================================================================
+  # TOGGLE: "true"  → use claude-mock (cheap, no API calls)
+  #         "false" → use real Claude Code CLI
+  # =============================================================================
+  USE_MOCK: "${USE_MOCK}"
+
+  JIRA_BASE_URL: "${JIRA_BASE_URL}"
+  JIRA_AUTH_BASIC: "${JIRA_AUTH_BASIC}"
+  SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
+  DEFAULT_BRANCH: "${DEFAULT_BRANCH}"
+  WORKSPACE_BASE: "${WORKSPACE_BASE}"
+  GITHUB_TOKEN: "${GITHUB_TOKEN}"
+  CLAUDE_MOCK_PATH: "${CLAUDE_MOCK_PATH}"
+  CLAUDE_REAL_PATH: "${CLAUDE_REAL_PATH}"
+
+tasks:
+
+# =============================================================================
+# STEP 1 — RESOLVE PAYLOAD (Webhook OR Manual)
+# =============================================================================
+  - id: resolve_payload
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ trigger is not null }}"
+    then:
+      - id: set_payload_webhook
+        type: io.kestra.plugin.core.execution.SetVariables
+        variables:
+          payload: "{{ trigger.body }}"
+    else:
+      - id: set_payload_manual
+        type: io.kestra.plugin.core.execution.SetVariables
+        variables:
+          payload: "{{ inputs.manual_payload }}"
+
+# =============================================================================
+# STEP 2 — EXTRACT ISSUE DATA
+# =============================================================================
+  - id: extract_issue_data
+    type: io.kestra.plugin.scripts.shell.Commands
+    runner: PROCESS
+    env:
+      PAYLOAD: "{{ vars.payload | toJson }}"
+    commands:
+      - |
+        set -e
+        python3 -c '
+        import os, json, sys
+        try:
+            raw_payload = os.environ.get("PAYLOAD", "{}")
+            data = json.loads(raw_payload)
+            if isinstance(data, str):
+                data = json.loads(data)
+            issue = data.get("issue", {})
+            fields = issue.get("fields", {})
+            out = {
+                "outputs": {
+                    "key": issue.get("key", "UNKNOWN"),
+                    "status": fields.get("status", {}).get("name", "Unknown"),
+                    "summary": fields.get("summary", "No summary"),
+                    "description": (fields.get("description") or "").rstrip()
+                }
+            }
+            print(f"::{json.dumps(out)}::")
+        except Exception as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        '
+
+# =============================================================================
+# STEP 3 — SLACK PREVIEW
+# =============================================================================
+  - id: slack_clean_preview
+    type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+    url: "{{ vars.SLACK_WEBHOOK_URL }}"
+    payload: |
+      {
+        "text": "🔎 Jira Ticket Received",
+        "blocks": [
+          {
+            "type": "header",
+            "text": {
+              "type": "plain_text",
+              "text": "🔎 Jira Ticket (Cleaned)"
+            }
+          },
+          {
+            "type": "section",
+            "fields": [
+              {
+                "type": "mrkdwn",
+                "text": "*Issue:* `{{ outputs.extract_issue_data.vars.key }}`"
+              },
+              {
+                "type": "mrkdwn",
+                "text": "*Status:* {{ outputs.extract_issue_data.vars.status }}"
+              }
+            ]
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "*Summary:*\n{{ outputs.extract_issue_data.vars.summary }}"
+            }
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "*Description:*\n```{{ outputs.extract_issue_data.vars.description }}```"
+            }
+          }
+        ]
+      }
+
+# =============================================================================
+# STEP 4 — STATUS ROUTING
+# =============================================================================
+  - id: validate_status
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.extract_issue_data.vars.status == 'Kestra Plan' or outputs.extract_issue_data.vars.status == 'Kestra Implement' }}"
+    then:
+
+# =============================================================================
+# STEP 5 — FETCH WEBLINKS
+# =============================================================================
+      - id: fetch_weblinks
+        type: io.kestra.plugin.core.http.Request
+        method: GET
+        uri: "{{ vars.JIRA_BASE_URL }}/rest/api/3/issue/{{ outputs.extract_issue_data.vars.key }}/remotelink"
+        headers:
+          Authorization: "Basic {{ vars.JIRA_AUTH_BASIC }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+          Accept-Encoding: "identity"
+
+# =============================================================================
+# STEP 6 — EXTRACT REPO URL
+# =============================================================================
+      - id: extract_repo
+        type: io.kestra.plugin.scripts.shell.Commands
+        runner: PROCESS
+        env:
+          WEBLINKS: "{{ outputs.fetch_weblinks.body | toJson }}"
+        commands:
+          - |
+            set -e
+            python3 -c '
+            import os, json, sys
+            try:
+                raw_links = os.environ.get("WEBLINKS", "[]")
+                weblinks = json.loads(raw_links)
+                if isinstance(weblinks, str):
+                    weblinks = json.loads(weblinks)
+                repo_url = "NONE"
+                if isinstance(weblinks, list) and len(weblinks) > 0:
+                    for link in weblinks:
+                        url = link.get("object", {}).get("url", "")
+                        if url and ("github.com" in url or "gitlab.com" in url or "bitbucket.org" in url):
+                            repo_url = url
+                            break
+                        if url and repo_url == "NONE":
+                            repo_url = url
+                output = json.dumps({"outputs": {"repo": repo_url}})
+                print(f"::{output}::")
+            except Exception as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                output = json.dumps({"outputs": {"repo": "NONE"}})
+                print(f"::{output}::")
+            '
+
+# =============================================================================
+# STEP 7 — CHECK REPO AND SETUP WORKSPACE
+# =============================================================================
+      - id: check_repo_valid
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.extract_repo.vars.repo != 'NONE' }}"
+        then:
+          - id: slack_repo_found
+            type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+            url: "{{ vars.SLACK_WEBHOOK_URL }}"
+            payload: |
+              {
+                "text": "📦 Repository Found",
+                "blocks": [
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "📦 *Repository detected*\n{{ outputs.extract_repo.vars.repo }}"
+                    }
+                  }
+                ]
+              }
+
+          - id: setup_workspace
+            type: io.kestra.plugin.scripts.shell.Commands
+            runner: PROCESS
+            env:
+              WORKSPACE_BASE: "{{ vars.WORKSPACE_BASE }}"
+              TICKET_KEY: "{{ outputs.extract_issue_data.vars.key }}"
+              TICKET_SUMMARY: "{{ outputs.extract_issue_data.vars.summary }}"
+              TICKET_STATUS: "{{ outputs.extract_issue_data.vars.status }}"
+              REPO_URL: "{{ outputs.extract_repo.vars.repo }}"
+              GITHUB_TOKEN: "{{ vars.GITHUB_TOKEN }}"
+            commands:
+              - |
+                set -e
+                export PATH="/usr/bin:/usr/local/bin:/bin:$PATH"
+
+                BRANCH_NAME=$(echo "${TICKET_SUMMARY}" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd '[:alnum:]_-')
+                echo "Branch name: $BRANCH_NAME"
+
+                if [ "$TICKET_STATUS" = "Kestra Implement" ]; then
+                  CLAUDE_MODE="implement"
+                else
+                  CLAUDE_MODE="plan"
+                fi
+                echo "Claude mode: $CLAUDE_MODE"
+
+                TICKET_DIR="${WORKSPACE_BASE}/${TICKET_KEY}"
+                REPO_PATH="${TICKET_DIR}/repo"
+                REPO_URL_AUTH=$(echo "$REPO_URL" | sed "s|https://github.com|https://${GITHUB_TOKEN}@github.com|")
+
+                mkdir -p "$TICKET_DIR"
+                cd "$TICKET_DIR"
+
+                if [ -d "repo/.git" ]; then
+                  echo "Workspace exists - updating..."
+                  cd repo
+                  git remote set-url origin "$REPO_URL_AUTH"
+                  git fetch origin
+                  git checkout main
+                  git reset --hard origin/main
+                  git clean -fdx
+                else
+                  echo "Cloning fresh..."
+                  git clone "$REPO_URL_AUTH" repo
+                  cd repo
+                fi
+
+                git config user.email "kestra@automation.com"
+                git config user.name "Kestra Bot"
+
+                if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+                  echo "Branch exists on remote - checking out..."
+                  git checkout -B "$BRANCH_NAME" "origin/$BRANCH_NAME"
+                else
+                  echo "Creating new branch: $BRANCH_NAME"
+                  git checkout -b "$BRANCH_NAME"
+                fi
+
+                output="{\"outputs\": {\"workspace\": \"$TICKET_DIR\", \"repo_path\": \"$REPO_PATH\", \"repo_url_auth\": \"$REPO_URL_AUTH\", \"branch_name\": \"$BRANCH_NAME\", \"claude_mode\": \"$CLAUDE_MODE\"}}"
+                echo "::${output}::"
+
+          - id: slack_workspace_ready
+            type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+            url: "{{ vars.SLACK_WEBHOOK_URL }}"
+            payload: |
+              {
+                "text": "✅ Workspace ready — Branch: `{{ outputs.setup_workspace.vars.branch_name }}` — Mode: `{{ outputs.setup_workspace.vars.claude_mode }}` — Engine: `{{ vars.USE_MOCK == 'true' ? 'mock' : 'real' }}`"
+              }
+
+# =============================================================================
+# STEP 8 — RUN CLAUDE (MOCK OR REAL) + GIT OPERATIONS
+# Toggle between engines using USE_MOCK variable at the top of this file.
+# =============================================================================
+          - id: git_operations
+            type: io.kestra.plugin.scripts.shell.Commands
+            runner: PROCESS
+            timeout: PT5M
+            env:
+              REPO_PATH: "{{ outputs.setup_workspace.vars.repo_path }}"
+              REPO_URL_AUTH: "{{ outputs.setup_workspace.vars.repo_url_auth }}"
+              BRANCH_NAME: "{{ outputs.setup_workspace.vars.branch_name }}"
+              CLAUDE_MODE: "{{ outputs.setup_workspace.vars.claude_mode }}"
+              TICKET_KEY: "{{ outputs.extract_issue_data.vars.key }}"
+              JIRA_SUMMARY: "{{ outputs.extract_issue_data.vars.summary }}"
+              JIRA_DESC: "{{ outputs.extract_issue_data.vars.description }}"
+              CLAUDE_MOCK_PATH: "{{ vars.CLAUDE_MOCK_PATH }}"
+              CLAUDE_REAL_PATH: "{{ vars.CLAUDE_REAL_PATH }}"
+              USE_MOCK: "{{ vars.USE_MOCK }}"
+            outputFiles:
+              - "claude_output.txt"
+            commands:
+              - |
+                export PATH="/home/mardan/.local/bin:/home/mardan/.local/share/fnm/node-versions/v24.12.0/installation/bin:/usr/bin:/usr/local/bin:/bin:$PATH"
+                export HOME=/home/mardan
+                export FORCE_COLOR=0
+                export TERM=dumb
+                export CI=true
+
+                TEMP_OUT="/tmp/kestra_git_$$.txt"
+
+                echo "=== KESTRA AUTOMATION REPORT ===" > "$TEMP_OUT"
+                echo "Ticket:      ${TICKET_KEY}" >> "$TEMP_OUT"
+                echo "Summary:     ${JIRA_SUMMARY}" >> "$TEMP_OUT"
+                echo "Description: ${JIRA_DESC}" >> "$TEMP_OUT"
+                echo "Branch:      ${BRANCH_NAME}" >> "$TEMP_OUT"
+                echo "Mode:        ${CLAUDE_MODE}" >> "$TEMP_OUT"
+                echo "Engine:      $([ "$USE_MOCK" = "true" ] && echo "claude-mock" || echo "claude (real)")" >> "$TEMP_OUT"
+                echo "" >> "$TEMP_OUT"
+
+                cd "$REPO_PATH" || { echo "FAILED: Cannot cd to $REPO_PATH" >> "$TEMP_OUT"; cp "$TEMP_OUT" "{{ workingDir }}/claude_output.txt"; exit 0; }
+
+                git config user.email "kestra@automation.com"
+                git config user.name "Kestra Bot"
+                git remote set-url origin "$REPO_URL_AUTH"
+                git checkout "$BRANCH_NAME" >> "$TEMP_OUT" 2>&1
+
+                echo "=== GIT PULL ===" >> "$TEMP_OUT"
+                git pull origin "$BRANCH_NAME" >> "$TEMP_OUT" 2>&1 || echo "Nothing to pull (new branch)" >> "$TEMP_OUT"
+                echo "" >> "$TEMP_OUT"
+
+                CLAUDE_PROMPT="Ticket: ${TICKET_KEY}. Summary: ${JIRA_SUMMARY}. Description: ${JIRA_DESC}. You are an AI developer. Analyse the codebase and fulfill the request described in the ticket."
+
+                # ---------------------------------------------------------------
+                # ENGINE SELECTION
+                # ---------------------------------------------------------------
+                if [ "$USE_MOCK" = "true" ]; then
+                  echo "=== RUNNING CLAUDE MOCK (mode: ${CLAUDE_MODE}) ===" >> "$TEMP_OUT"
+                  if [ "$CLAUDE_MODE" = "implement" ]; then
+                    echo "Running in IMPLEMENT mode (--dangerously-skip-permissions)" >> "$TEMP_OUT"
+                    bash "$CLAUDE_MOCK_PATH" -p "$CLAUDE_PROMPT" --dangerously-skip-permissions --output "$TEMP_OUT" >> "$TEMP_OUT" 2>&1
+                  else
+                    echo "Running in PLAN mode (--plan)" >> "$TEMP_OUT"
+                    bash "$CLAUDE_MOCK_PATH" -p "$CLAUDE_PROMPT" --plan --output "$TEMP_OUT" >> "$TEMP_OUT" 2>&1
+                  fi
+                  CLAUDE_EXIT=0
+                else
+                  echo "=== RUNNING REAL CLAUDE CODE (mode: ${CLAUDE_MODE}) ===" >> "$TEMP_OUT"
+                  RAW_OUT="/tmp/claude_raw_$$.txt"
+                  set +e
+                  if [ "$CLAUDE_MODE" = "implement" ]; then
+                    echo "Running in IMPLEMENT mode (--dangerously-skip-permissions)" >> "$TEMP_OUT"
+                    timeout 240 su admin -c "env PATH=\"$PATH\" HOME=/home/mardan FORCE_COLOR=0 TERM=dumb CI=true \"$CLAUDE_REAL_PATH\" -p \"$CLAUDE_PROMPT\" --dangerously-skip-permissions < /dev/null" > "$RAW_OUT" 2>&1
+                  else
+                    echo "Running in PLAN mode (--permission-mode plan)" >> "$TEMP_OUT"
+                    timeout 240 su admin -c "env PATH=\"$PATH\" HOME=/home/mardan FORCE_COLOR=0 TERM=dumb CI=true \"$CLAUDE_REAL_PATH\" -p \"$CLAUDE_PROMPT\" --permission-mode plan < /dev/null" > "$RAW_OUT" 2>&1
+                  fi
+                  CLAUDE_EXIT=$?
+                  set -e
+                  # Strip ANSI escape codes
+                  sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g; s/\x1B\][0-9;]*;//g; s/\r//g' "$RAW_OUT" >> "$TEMP_OUT"
+                  if [ $CLAUDE_EXIT -eq 124 ]; then
+                    echo "ERROR: Claude CLI timed out after 240 seconds" >> "$TEMP_OUT"
+                  elif [ $CLAUDE_EXIT -ne 0 ]; then
+                    echo "ERROR: Claude CLI exited with code $CLAUDE_EXIT" >> "$TEMP_OUT"
+                  fi
+                fi
+
+                echo "" >> "$TEMP_OUT"
+
+                # ---------------------------------------------------------------
+                # GIT COMMIT (implement mode only)
+                # For mock: always commits. For real: only if Claude succeeded.
+                # ---------------------------------------------------------------
+                if [ "$CLAUDE_MODE" = "implement" ] && { [ "$USE_MOCK" = "true" ] || [ $CLAUDE_EXIT -eq 0 ]; }; then
+                  if [ "$USE_MOCK" = "true" ]; then
+                    # Mock: write a README entry as a stand-in for real changes
+                    echo "=== EDITING README.md ===" >> "$TEMP_OUT"
+                    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+                    echo "" >> README.md
+                    echo "---" >> README.md
+                    echo "## ${TICKET_KEY} - ${JIRA_SUMMARY}" >> README.md
+                    echo "**Branch:** ${BRANCH_NAME}" >> README.md
+                    echo "**Date:** ${TIMESTAMP}" >> README.md
+                    echo "**Description:** ${JIRA_DESC}" >> README.md
+                    echo "" >> README.md
+                    echo "Processed by Kestra automation (mock implement mode)." >> README.md
+                    echo "README.md updated" >> "$TEMP_OUT"
+                    echo "" >> "$TEMP_OUT"
+                  fi
+
+                  echo "=== GIT ADD ===" >> "$TEMP_OUT"
+                  git add -A >> "$TEMP_OUT" 2>&1
+
+                  if git diff --cached --quiet; then
+                    echo "No changes to commit." >> "$TEMP_OUT"
+                  else
+                    echo "=== GIT COMMIT ===" >> "$TEMP_OUT"
+                    git commit -m "🤖 ${TICKET_KEY}: ${JIRA_SUMMARY}" >> "$TEMP_OUT" 2>&1
+
+                    echo "=== GIT PUSH ===" >> "$TEMP_OUT"
+                    git push origin "$BRANCH_NAME" >> "$TEMP_OUT" 2>&1
+
+                    echo "" >> "$TEMP_OUT"
+                    echo "=== LATEST COMMIT ===" >> "$TEMP_OUT"
+                    git log -1 --pretty=format:"Hash: %H%nAuthor: %an%nDate: %ad%nMessage: %s%n" >> "$TEMP_OUT" 2>&1
+                  fi
+                elif [ "$CLAUDE_MODE" = "implement" ] && [ $CLAUDE_EXIT -ne 0 ]; then
+                  echo "=== SKIPPING COMMIT: Claude exited with error ===" >> "$TEMP_OUT"
+                else
+                  echo "=== PLAN MODE: No files committed ===" >> "$TEMP_OUT"
+                  echo "Review the plan above and move ticket to 'Kestra Implement' to apply changes." >> "$TEMP_OUT"
+                fi
+
+                echo "" >> "$TEMP_OUT"
+                echo "=== DONE ===" >> "$TEMP_OUT"
+
+                cat "$TEMP_OUT"
+                cp "$TEMP_OUT" "{{ workingDir }}/claude_output.txt"
+                exit 0
+
+          - id: slack_git_done
+            type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+            url: "{{ vars.SLACK_WEBHOOK_URL }}"
+            payload: |
+              {
+                "text": "🚀 `{{ vars.USE_MOCK == 'true' ? 'claude-mock' : 'claude (real)' }}` ran in `{{ outputs.setup_workspace.vars.claude_mode }}` mode for `{{ outputs.extract_issue_data.vars.key }}` on branch `{{ outputs.setup_workspace.vars.branch_name }}`"
+              }
+
+# =============================================================================
+# STEP 9 — ESCAPE OUTPUT AND COMMENT TO JIRA
+# inputFiles maps kestra:// → local file before the script runs (Kestra native)
+# =============================================================================
+          - id: prepare_jira_comment
+            type: io.kestra.plugin.scripts.shell.Commands
+            runner: PROCESS
+            inputFiles:
+              input_content.txt: "{{ outputs.git_operations.outputFiles['claude_output.txt'] }}"
+            outputFiles:
+              - "escaped_output.json"
+            commands:
+              - |
+                python3 -c "
+                import json
+                with open('input_content.txt', 'r') as f:
+                    content = f.read()
+                escaped = json.dumps(content)
+                with open('escaped_output.json', 'w') as f:
+                    f.write(escaped)
+                "
+
+          - id: comment_claude
+            type: io.kestra.plugin.core.http.Request
+            method: POST
+            uri: "{{ vars.JIRA_BASE_URL }}/rest/api/3/issue/{{ outputs.extract_issue_data.vars.key }}/comment"
+            headers:
+              Authorization: "Basic {{ vars.JIRA_AUTH_BASIC }}"
+              Content-Type: "application/json"
+            body: |
+              {
+                "body": {
+                  "type": "doc",
+                  "version": 1,
+                  "content": [
+                    {
+                      "type": "codeBlock",
+                      "attrs": { "language": "text" },
+                      "content": [
+                        { "type": "text", "text": {{ read(outputs.prepare_jira_comment.outputFiles['escaped_output.json']) }} }
+                      ]
+                    }
+                  ]
+                }
+              }
+
+          - id: slack_jira_done
+            type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+            url: "{{ vars.SLACK_WEBHOOK_URL }}"
+            payload: |
+              {
+                "text": "✅ Jira ticket {{ outputs.extract_issue_data.vars.key }} commented successfully!"
+              }
+
+        else:
+          - id: slack_no_repo
+            type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+            url: "{{ vars.SLACK_WEBHOOK_URL }}"
+            payload: |
+              {
+                "text": "⚠️ No repository link found in Jira ticket - skipping"
+              }
+
+    else:
+      - id: slack_skipped
+        type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+        url: "{{ vars.SLACK_WEBHOOK_URL }}"
+        payload: |
+          {
+            "text": "⏭️ Skipped — Status must be 'Kestra Plan' or 'Kestra Implement' (got: {{ outputs.extract_issue_data.vars.status }})"
+          }
+
+errors:
+  - id: slack_error
+    type: io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+    url: "{{ vars.SLACK_WEBHOOK_URL }}"
+    payload: |
+      {
+        "text": "❌ Flow Failed - Execution: {{ execution.id }}"
+      }

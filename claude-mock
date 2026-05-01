@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# =============================================================================
+# claude-mock - Mock Claude Code CLI
+# Usage:
+#   ./claude-mock -p "prompt here" --plan          → plan mode (default)
+#   ./claude-mock -p "prompt here" --dangerously-skip-permissions  → implement mode
+# =============================================================================
+
+PROMPT=""
+MODE="plan"
+OUTPUT_FILE="test.txt"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -p)
+            PROMPT="$2"
+            shift 2
+            ;;
+        --dangerously-skip-permissions)
+            MODE="implement"
+            shift 1
+            ;;
+        --plan)
+            MODE="plan"
+            shift 1
+            ;;
+        --output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown parameter: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate prompt
+if [[ -z "$PROMPT" ]]; then
+    echo "Error: You must provide a prompt using the -p flag."
+    echo "Usage: ./claude-mock -p \"your prompt\" [--plan|--dangerously-skip-permissions]"
+    exit 1
+fi
+
+# Run based on mode
+if [[ "$MODE" == "implement" ]]; then
+    echo "⚡ [IMPLEMENT MODE] Running with full permissions..."
+    echo "Warning: Dangerously skipping safety checks..."
+
+    {
+        echo "================================================================"
+        echo "  CLAUDE MOCK - IMPLEMENT MODE"
+        echo "  Timestamp: ${TIMESTAMP}"
+        echo "================================================================"
+        echo ""
+        echo "  Prompt: ${PROMPT}"
+        echo ""
+        echo "  Mode: IMPLEMENT (--dangerously-skip-permissions)"
+        echo "  Status: Executing with full permissions"
+        echo ""
+        echo "  [MOCK] Analysing codebase..."
+        echo "  [MOCK] Planning changes..."
+        echo "  [MOCK] Implementing changes..."
+        echo "  [MOCK] Running tests..."
+        echo "  [MOCK] Changes applied successfully."
+        echo ""
+        echo "================================================================"
+        echo "  RESULT: SUCCESS"
+        echo "================================================================"
+    } >> "$OUTPUT_FILE"
+
+    echo "✅ Implement mode complete. Output written to: $OUTPUT_FILE"
+
+elif [[ "$MODE" == "plan" ]]; then
+    echo "📋 [PLAN MODE] Generating plan only (no changes made)..."
+
+    {
+        echo "================================================================"
+        echo "  CLAUDE MOCK - PLAN MODE"
+        echo "  Timestamp: ${TIMESTAMP}"
+        echo "================================================================"
+        echo ""
+        echo "  Prompt: ${PROMPT}"
+        echo ""
+        echo "  Mode: PLAN (read-only, no changes)"
+        echo "  Status: Generating implementation plan"
+        echo ""
+        echo "  [MOCK] Analysing codebase..."
+        echo "  [MOCK] Identifying affected files..."
+        echo "  [MOCK] Generating step-by-step plan..."
+        echo ""
+        echo "  PLAN:"
+        echo "  1. Review current implementation"
+        echo "  2. Identify areas requiring changes"
+        echo "  3. Draft proposed modifications"
+        echo "  4. Validate approach"
+        echo "  5. Ready for implementation (run with --dangerously-skip-permissions)"
+        echo ""
+        echo "  NOTE: No files were modified. Review plan and run in implement mode."
+        echo ""
+        echo "================================================================"
+        echo "  RESULT: PLAN GENERATED"
+        echo "================================================================"
+    } >> "$OUTPUT_FILE"
+
+    echo "✅ Plan mode complete. Output written to: $OUTPUT_FILE"
+fi
